@@ -15,19 +15,30 @@ int vm_init(struct vm* vm, size_t mem_size){
         return -1;
     }
 
+    if (ioctl(vm->fd, KVM_CREATE_IRQCHIP, 0) == -1){
+        perror("KVM CREATE IRQCHIP");
+        return -1;
+    }
+
+    struct kvm_pit_config pit_config = { .flags = 0 };
+    if (ioctl(vm->fd, KVM_CREATE_PIT2, &pit_config) == -1){
+        perror("KVM CREATE PIT2");
+        return -1;
+    }
 
     vm->mem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (vm->mem == MAP_FAILED){
         printf("VM memory map failed\n");
         return -1;
     }
+    vm->mem_size = mem_size;
 
     struct kvm_userspace_memory_region memreg;
     memreg.slot = 0;
     memreg.flags = 0;
     memreg.guest_phys_addr = 0;
     memreg.memory_size = mem_size;
-    memreg.userspace_addr = vm->mem;
+    memreg.userspace_addr = (uint64_t)vm->mem;
     if (ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &memreg) == -1){
         perror("KVM SET USER MEMORY REGION");
         return -1;
@@ -84,7 +95,21 @@ int cpuid_init(struct vm* vm, struct vcpu* vcpu){
 }
 
 int vm_run(struct vm* vm, struct vcpu* vcpu){
+    uint8_t ier, lcr, mcr, scratch;
+    ier = lcr = mcr = scratch = 0;
+
     for(;;){
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv = {0, 0};
+        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0 && (ier & 0x1)) {
+            struct kvm_irq_level irq_level = { .irq = 4, .level = 1 };
+            ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+            irq_level.level = 0;
+            ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+        }
+
         if (ioctl(vcpu->fd, KVM_RUN, 0) == -1){
             perror("KVM RUN");
             return -1;
@@ -97,19 +122,69 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
             }
 
             case KVM_EXIT_IO:
+                fprintf(stderr, "[IO] %s port=%#x size=%u data=%#x\n",
+                    vcpu->run->io.direction == KVM_EXIT_IO_OUT ? "OUT" : "IN",
+                    vcpu->run->io.port,
+                    vcpu->run->io.size,
+                    vcpu->run->io.direction == KVM_EXIT_IO_OUT
+                        ? *((unsigned char*)vcpu->run + vcpu->run->io.data_offset)
+                        : 0);
+
                 if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F8) {
                     fwrite((char*)vcpu->run + vcpu->run->io.data_offset, vcpu->run->io.size, 1, stdout);
                     fflush(stdout);
                     continue;
-                } else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FD){
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0x60;
+                } 
+                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FD){
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(STDIN_FILENO, &fds);
+                    struct timeval tv = {0, 0};
+                    int has_data = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = has_data ? 0x61 : 0x60;
                     continue;
                 }
-
-                /* printf("IO %s port=%#x size=%u\n",
-                    vcpu->run->io.direction == KVM_EXIT_IO_OUT ? "OUT" : "IN",
-                    vcpu->run->io.port,
-                    vcpu->run->io.size); */
+                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3F8){
+                    char c = 0;
+                    read(STDIN_FILENO, &c, 1);
+                    fprintf(stderr, "[DEBUG] sending bytes 0x%02x to guest", (unsigned char)c);
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = c;
+                    continue;
+                }
+                else if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F9){
+                    ier = *((char*)vcpu->run + vcpu->run->io.data_offset);
+                    continue;
+                }
+                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FA){
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0x04;
+                    continue;
+                }
+                else if (vcpu->run->io.port == 0x3FB){
+                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
+                        lcr = *((char*)vcpu->run + vcpu->run->io.data_offset);
+                    else
+                        *((char*)vcpu->run + vcpu->run->io.data_offset) = lcr;
+                    continue;
+                }
+                else if (vcpu->run->io.port == 0x3FC){
+                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
+                        mcr = *((char*)vcpu->run + vcpu->run->io.data_offset);
+                    else
+                        *((char*)vcpu->run + vcpu->run->io.data_offset) = mcr;
+                    continue;
+                }
+                else if (vcpu->run->io.port == 0x3FE && vcpu->run->io.direction == KVM_EXIT_IO_IN){
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0x30; // CTS+DSR set, looks "connected"
+                    continue;
+                }
+                else if (vcpu->run->io.port == 0x3FF){
+                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
+                        scratch = *((char*)vcpu->run + vcpu->run->io.data_offset);
+                    else
+                        *((char*)vcpu->run + vcpu->run->io.data_offset) = scratch; // must echo back what was written
+                    continue;
+                }
             
             default:
                 // printf("not handled %u\n", vcpu->run->exit_reason);
@@ -175,9 +250,14 @@ int load_bzimage(struct vm* vm, const char* filename){
     /* QUIET_FLAG == 0, CAN_USE_HEAP == 1 */
     boot.hdr.loadflags = ((boot.hdr.loadflags & ~0x20) | 0x80);
 
-    /* COME BACK TO CHANGE WHEN DOING INITRAM */
-    boot.hdr.ramdisk_image = 0;
-    boot.hdr.ramdisk_size = 0;
+    size_t initramfs_size;
+    if (load_initramfs(vm, &initramfs_size) == -1){
+        printf("failed to load initramfs\n");
+        return -1;
+    }
+
+    boot.hdr.ramdisk_image = 0x4000000;
+    boot.hdr.ramdisk_size = initramfs_size;
 
     /* 0x9800 as suggested by boot.txt */
     boot.hdr.heap_end_ptr = 0x9800 - 0x200;
@@ -187,11 +267,54 @@ int load_bzimage(struct vm* vm, const char* filename){
 
     boot.hdr.hardware_subarch = 0;
 
+    boot.e820_table[0].addr = 0;
+    boot.e820_table[0].size = 0x09FC00;
+    boot.e820_table[0].type = 1; // E820_RAM
+
+    boot.e820_table[1].addr = 0x09FC00;
+    boot.e820_table[1].size = 0x100000 - 0x09FC00;
+    boot.e820_table[1].type = 2; // E820_RESERVED
+
+    boot.e820_table[2].addr = 0x100000;
+    boot.e820_table[2].size = vm->mem_size - 0x100000;
+    boot.e820_table[2].type = 1;
+
+    boot.e820_entries = 3;
+
     /* Load boot_params at 0x10000 in guest memory */
     memcpy((char*)vm->mem + 0x10000, &boot, sizeof(struct boot_params));
 
     fclose(bzimage);
 
+    return 0;
+}
+
+int load_initramfs(struct vm* vm, size_t* out_size){
+    FILE* initramfs = fopen("initramfs.cpio.gz", "rb");
+    if (initramfs == NULL){
+        printf("failed to open initramfs\n");
+        return -1;
+    }
+
+    if (fseek(initramfs, 0, SEEK_END)){
+        printf("seek end 0 fail\n");
+        return -1;
+    }
+
+    long initramfs_size = ftell(initramfs);
+
+    if (fseek(initramfs, 0, SEEK_SET)){
+        printf("seek set 0 fail\n");
+        return -1;
+    }
+
+    if (fread((char*)vm->mem + 0x4000000, 1, initramfs_size, initramfs) != initramfs_size){
+        printf("failed to load initramfs\n");
+        return -1;
+    }
+
+    fclose(initramfs);
+    *out_size = (size_t)initramfs_size;
     return 0;
 }
 

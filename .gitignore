@@ -2,4 +2,7 @@ kvm-hello-world/
 kvmtool/
 linux/
 bzImage
+notes.txt
 out
+trace.log
+initramfs.cpio.gz

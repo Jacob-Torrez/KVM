@@ -1,4 +1,5 @@
 #include "kvm.h"
+#include "console.h"
 
 int main(){
     struct vm vm;
@@ -24,9 +25,15 @@ int main(){
         return -1;
     }
 
+    signal(SIGINT, handle_sigint);
+    atexit(disable_raw_mode);
+    enable_raw_mode();
+
     if (vm_run(&vm, &vcpu) == -1){
         return -1;
     }
+
+    disable_raw_mode();
 
     return 0;
 }
