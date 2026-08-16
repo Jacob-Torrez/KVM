@@ -12,6 +12,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/select.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <signal.h>
 
 static const char* BZMAGIC = "HdrS";
 

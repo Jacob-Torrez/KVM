@@ -1,5 +1,4 @@
 #include "kvm.h"
-#include <errno.h>
 
 int vm_init(struct vm* vm, size_t mem_size){
     vm->sys_fd = open("/dev/kvm", O_RDWR);
@@ -94,9 +93,22 @@ int cpuid_init(struct vm* vm, struct vcpu* vcpu){
     free(cpuid);
 }
 
+static void sigalrm_handler(int sig) {
+    (void)sig;
+}
+
 int vm_run(struct vm* vm, struct vcpu* vcpu){
     uint8_t ier, lcr, mcr, scratch;
     ier = lcr = mcr = scratch = 0;
+
+    signal(SIGALRM, sigalrm_handler);
+    siginterrupt(SIGALRM, 1);
+
+    struct itimerval timer = {
+        .it_value = { .tv_sec = 0, .tv_usec = 10000 },
+        .it_interval = { .tv_sec = 0, .tv_usec = 10000},
+    };
+    setitimer(ITIMER_REAL, &timer, NULL);
 
     for(;;){
         fd_set fds;
@@ -111,6 +123,7 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
         }
 
         if (ioctl(vcpu->fd, KVM_RUN, 0) == -1){
+            if (errno = EINTR) continue;
             perror("KVM RUN");
             return -1;
         }
