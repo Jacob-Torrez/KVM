@@ -117,8 +117,8 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
 
         switch (vcpu->run->exit_reason){
             case KVM_EXIT_HLT: {
-                dump_regs(vcpu);
-                return 0;
+                // dump_regs(vcpu);
+                continue;
             }
 
             case KVM_EXIT_IO:
@@ -133,6 +133,12 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
                 if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F8) {
                     fwrite((char*)vcpu->run + vcpu->run->io.data_offset, vcpu->run->io.size, 1, stdout);
                     fflush(stdout);
+                    if (ier & 0x02) {
+                        struct kvm_irq_level irq_level = { .irq = 4, .level = 1};
+                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                        irq_level.level = 0;
+                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                    }
                     continue;
                 } 
                 else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FD){
@@ -153,11 +159,38 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
                     continue;
                 }
                 else if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F9){
-                    ier = *((char*)vcpu->run + vcpu->run->io.data_offset);
+                    uint8_t new_ier = *((char*)vcpu->run + vcpu->run->io.data_offset);
+
+                    if ((new_ier & 0x02) && !(ier & 0x02)) {
+                        struct kvm_irq_level irq_level = { .irq = 4, .level = 1};
+                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                        irq_level.level = 0;
+                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                    }
+
+                    ier = new_ier;
+                    continue;
+                }
+                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3F9){
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = ier;
                     continue;
                 }
                 else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FA){
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0x04;
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(STDIN_FILENO, &fds);
+                    struct timeval tv = {0, 0};
+                    int rx_ready = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+
+                    uint8_t iir;
+                    if (rx_ready && (ier & 0x01))
+                        iir = 0x04;
+                    else if (ier & 0x02)
+                        iir = 0x02;
+                    else
+                        iir = 0x01;
+
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = iir;
                     continue;
                 }
                 else if (vcpu->run->io.port == 0x3FB){
@@ -175,7 +208,7 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
                     continue;
                 }
                 else if (vcpu->run->io.port == 0x3FE && vcpu->run->io.direction == KVM_EXIT_IO_IN){
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0x30; // CTS+DSR set, looks "connected"
+                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0xB0; // DCD+CTS+DSR set
                     continue;
                 }
                 else if (vcpu->run->io.port == 0x3FF){
@@ -263,7 +296,7 @@ int load_bzimage(struct vm* vm, const char* filename){
     boot.hdr.heap_end_ptr = 0x9800 - 0x200;
 
     boot.hdr.cmd_line_ptr = 0x90000 + 0x9800;
-    strcpy((char*)vm->mem + 0x90000 + 0x9800, "console=ttyS0 earlyprintk=serial ignore_loglevel loglevel=8 nokaslr");
+    strcpy((char*)vm->mem + 0x90000 + 0x9800, "console=ttyS0,115200 earlyprintk=ttyS0 ignore_loglevel loglevel=8 nokaslr");
 
     boot.hdr.hardware_subarch = 0;
 
