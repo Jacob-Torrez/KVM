@@ -32,11 +32,7 @@ int vm_init(struct vm* vm, size_t mem_size);
 int vcpu_init(struct vm* vm, struct vcpu* vcpu);
 int vm_run(struct vm* vm, struct vcpu* vcpu);
 int cpuid_init(struct vm* vm, struct vcpu* vcpu);
-
 int load_bzimage(struct vm* vm, const char* filename);
-int load_initramfs(struct vm* vm, size_t* out_size);
 int setup_regs(struct vcpu* vcpu);
-
-void dump_regs(struct vcpu* vcpu);
 
 #endif

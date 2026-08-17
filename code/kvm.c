@@ -125,6 +125,15 @@ int cpuid_init(struct vm* vm, struct vcpu* vcpu){
     return 0;
 }
 
+static void dump_regs(struct vcpu* vcpu){
+    struct kvm_regs regs;
+
+    ioctl(vcpu->fd, KVM_GET_REGS, &regs);
+
+    printf("finished at rip=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
+        regs.rip, regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi);
+}
+
 static void sigalrm_handler(int sig) {
     (void)sig; /* no-op: interrupt blocked KVM_RUN */
 }
@@ -330,6 +339,38 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
     }
 }
 
+static int load_initramfs(struct vm* vm, size_t* out_size){
+    FILE* initramfs = fopen("initramfs.cpio.gz", "rb");
+    if (initramfs == NULL){
+        printf("failed to open initramfs\n");
+        return -1;
+    }
+
+    if (fseek(initramfs, 0, SEEK_END)){
+        printf("seek end 0 fail\n");
+        fclose(initramfs);
+        return -1;
+    }
+
+    long initramfs_size = ftell(initramfs);
+
+    if (fseek(initramfs, 0, SEEK_SET)){
+        printf("seek set 0 fail\n");
+        fclose(initramfs);
+        return -1;
+    }
+
+    if (fread((char*)vm->mem + 0x4000000, 1, initramfs_size, initramfs) != initramfs_size){
+        printf("failed to load initramfs\n");
+        fclose(initramfs);
+        return -1;
+    }
+
+    fclose(initramfs);
+    *out_size = (size_t)initramfs_size;
+    return 0;
+}
+
 /* Loads the bzimage into guest memory AND sets up the boot_params struct */
 int load_bzimage(struct vm* vm, const char* filename){
     FILE* bzimage = fopen(filename, "rb");
@@ -433,38 +474,6 @@ int load_bzimage(struct vm* vm, const char* filename){
     return 0;
 }
 
-int load_initramfs(struct vm* vm, size_t* out_size){
-    FILE* initramfs = fopen("initramfs.cpio.gz", "rb");
-    if (initramfs == NULL){
-        printf("failed to open initramfs\n");
-        return -1;
-    }
-
-    if (fseek(initramfs, 0, SEEK_END)){
-        printf("seek end 0 fail\n");
-        fclose(initramfs);
-        return -1;
-    }
-
-    long initramfs_size = ftell(initramfs);
-
-    if (fseek(initramfs, 0, SEEK_SET)){
-        printf("seek set 0 fail\n");
-        fclose(initramfs);
-        return -1;
-    }
-
-    if (fread((char*)vm->mem + 0x4000000, 1, initramfs_size, initramfs) != initramfs_size){
-        printf("failed to load initramfs\n");
-        fclose(initramfs);
-        return -1;
-    }
-
-    fclose(initramfs);
-    *out_size = (size_t)initramfs_size;
-    return 0;
-}
-
 int setup_regs(struct vcpu* vcpu){
     struct kvm_regs regs;
     struct kvm_sregs sregs;
@@ -503,13 +512,4 @@ int setup_regs(struct vcpu* vcpu){
     }
 
     return 0;
-}
-
-void dump_regs(struct vcpu* vcpu){
-    struct kvm_regs regs;
-
-    ioctl(vcpu->fd, KVM_GET_REGS, &regs);
-
-    printf("finished at rip=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
-        regs.rip, regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi);
 }
