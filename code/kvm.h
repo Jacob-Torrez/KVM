@@ -16,8 +16,6 @@
 #include <sys/time.h>
 #include <signal.h>
 
-static const char* BZMAGIC = "HdrS";
-
 struct vm {
     int sys_fd;
     int fd;

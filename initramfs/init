@@ -1,17 +1,9 @@
 #!/bin/busybox sh
-echo "init: start"
 busybox mount -t proc none /proc
-echo "init: proc mounted, rc=$?"
 busybox mount -t sysfs none /sys
-echo "init: sysfs mounted, rc=$?"
 busybox mount -t devtmpfs none /dev
-echo "init: devtmpfs mounted, rc=$?"
-echo "Hello from initramfs!"
-busybox ls -la /dev
 
 while true; do
-    echo "init: spawning shell"
     busybox setsid busybox cttyhack /bin/sh
-    echo "init: shell exited"
     busybox sleep 1
 done

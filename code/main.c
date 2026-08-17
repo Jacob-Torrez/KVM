@@ -27,6 +27,10 @@ int main(){
 
     signal(SIGINT, handle_sigint);
     atexit(disable_raw_mode);
+
+    printf("Starting guest console. Press Ctrl-A then X to exit.\r\n");
+    fflush(stdout);
+
     enable_raw_mode();
 
     if (vm_run(&vm, &vcpu) == -1){

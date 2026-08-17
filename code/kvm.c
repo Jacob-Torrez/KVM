@@ -1,4 +1,35 @@
 #include "kvm.h"
+#include "console.h"
+
+static const char* BZMAGIC = "HdrS";
+
+#define UART_BASE 0x3F8
+#define UART_RBR (UART_BASE + 0) /* Receiver Buffer Register (read)                     */
+#define UART_THR (UART_BASE + 0) /* Trasmitter Holding Register (write)                 */
+#define UART_IER (UART_BASE + 1) /* Interrupt Enable Register                           */
+#define UART_IIR (UART_BASE + 2) /* Interrupt Identification Register (read)            */
+#define UART_LCR (UART_BASE + 3) /* Line Control Register                               */
+#define UART_MCR (UART_BASE + 4) /* Modem Control Register                              */
+#define UART_LSR (UART_BASE + 5) /* Line Status Register (read)                         */
+#define UART_MSR (UART_BASE + 6) /* Modem Status Register (read)                        */
+#define UART_SCR (UART_BASE + 7) /* Sratch Register                                     */
+
+#define UART_IER_RDI 0x01        /* Enable received-data-available interrupt            */
+#define UART_IER_THRI 0x02       /* Enable transmitter-holding-register-empty interrupt */
+
+#define UART_IIR_NO_INT 0x01
+#define UART_IIR_THRI 0x02       /* Transmitter holding register empty                  */
+#define UART_IIR_RDI 0x04        /* Received data available                             */
+
+#define UART_LSR_DR 0x01         /* Data ready                                          */
+#define UART_LSR_THRE 0x20       /* Transmitter holding register empty                  */
+#define UART_LSR_TEMT 0x40       /* Transmitter empty                                   */
+
+#define UART_MSR_CTS 0x10
+#define UART_MSR_DSR 0x20
+#define UART_MSR_DCD 0x80
+
+#define SERIAL_IRQ 4
 
 int vm_init(struct vm* vm, size_t mem_size){
     vm->sys_fd = open("/dev/kvm", O_RDWR);
@@ -91,150 +122,210 @@ int cpuid_init(struct vm* vm, struct vcpu* vcpu){
     }
 
     free(cpuid);
+    return 0;
 }
 
 static void sigalrm_handler(int sig) {
-    (void)sig;
+    (void)sig; /* no-op: interrupt blocked KVM_RUN */
+}
+
+static int stdin_has_data(void){
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = {0, 0};
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+static void raise_irq4(struct vm* vm){
+    struct kvm_irq_level irq_level = { .irq = SERIAL_IRQ, .level = 1 };
+    ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+    irq_level.level = 0;
+    ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+}
+
+#define ESCAPE_KEY 0x01 /* CTRL-A */
+
+/* Reads one byte from stdin for the guest, intercepting the CTRL-A x escape
+sequence so the user always has a way out. */
+static char read_console_byte(void){
+    static int escape_pending = 0;
+
+    for (;;) {
+        char c = 0;
+        ssize_t n;
+        do {
+            n = read(STDIN_FILENO, &c, 1);
+        } while (n == -1 && errno == EINTR);
+        if (n <= 0) return 0;
+
+        if (escape_pending) {
+            escape_pending = 0;
+            if (c == 'x' || c == 'X') {
+                disable_raw_mode();
+                printf("\r\n[detached from guest]\r\n");
+                exit(0);
+            }
+            return c;
+        }
+
+        if (c == ESCAPE_KEY) {
+            escape_pending = 1;
+            continue;
+        }
+
+        return c;
+    }
 }
 
 int vm_run(struct vm* vm, struct vcpu* vcpu){
     uint8_t ier, lcr, mcr, scratch;
     ier = lcr = mcr = scratch = 0;
 
+    /* KVM_RUN blocks inside the kernel while the vCPU is halted and waiting 
+    for an interrupt. A periodic SIGALRM (delivered w/o SA_RESTART) kicks it
+    back out with EINTR so we can poll stdin and, if a byte is waiting and
+    the guest has RX interrupts enabled, inject IRQ4 to wake the vCPU back
+    up. */
     signal(SIGALRM, sigalrm_handler);
     siginterrupt(SIGALRM, 1);
 
     struct itimerval timer = {
         .it_value = { .tv_sec = 0, .tv_usec = 10000 },
-        .it_interval = { .tv_sec = 0, .tv_usec = 10000},
+        .it_interval = { .tv_sec = 0, .tv_usec = 10000 },
     };
     setitimer(ITIMER_REAL, &timer, NULL);
 
     for(;;){
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-        struct timeval tv = {0, 0};
-        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0 && (ier & 0x1)) {
-            struct kvm_irq_level irq_level = { .irq = 4, .level = 1 };
-            ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
-            irq_level.level = 0;
-            ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+        if (stdin_has_data() && (ier & UART_IER_RDI)) {
+            raise_irq4(vm);
         }
 
         if (ioctl(vcpu->fd, KVM_RUN, 0) == -1){
-            if (errno = EINTR) continue;
+            if (errno == EINTR) continue;
             perror("KVM RUN");
             return -1;
         }
 
         switch (vcpu->run->exit_reason){
             case KVM_EXIT_HLT: {
-                // dump_regs(vcpu);
                 continue;
             }
 
-            case KVM_EXIT_IO:
-                fprintf(stderr, "[IO] %s port=%#x size=%u data=%#x\n",
-                    vcpu->run->io.direction == KVM_EXIT_IO_OUT ? "OUT" : "IN",
-                    vcpu->run->io.port,
-                    vcpu->run->io.size,
-                    vcpu->run->io.direction == KVM_EXIT_IO_OUT
-                        ? *((unsigned char*)vcpu->run + vcpu->run->io.data_offset)
-                        : 0);
+            case KVM_EXIT_IO: {
+                uint16_t port = vcpu->run->io.port;
+                int is_out = (vcpu->run->io.direction == KVM_EXIT_IO_OUT);    
+                uint8_t* data = (uint8_t*)vcpu->run + vcpu->run->io.data_offset;
 
-                if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F8) {
-                    fwrite((char*)vcpu->run + vcpu->run->io.data_offset, vcpu->run->io.size, 1, stdout);
+                if (port == UART_THR && is_out) {
+                    fwrite(data, vcpu->run->io.size, 1, stdout);
                     fflush(stdout);
-                    if (ier & 0x02) {
-                        struct kvm_irq_level irq_level = { .irq = 4, .level = 1};
-                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
-                        irq_level.level = 0;
-                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                    if (ier & UART_IER_THRI) {
+                        raise_irq4(vm);
                     }
                     continue;
                 } 
-                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FD){
-                    fd_set fds;
-                    FD_ZERO(&fds);
-                    FD_SET(STDIN_FILENO, &fds);
-                    struct timeval tv = {0, 0};
-                    int has_data = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
-
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = has_data ? 0x61 : 0x60;
+                else if (port == UART_RBR && !is_out){
+                    *data = read_console_byte();
                     continue;
                 }
-                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3F8){
-                    char c = 0;
-                    read(STDIN_FILENO, &c, 1);
-                    fprintf(stderr, "[DEBUG] sending bytes 0x%02x to guest", (unsigned char)c);
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = c;
-                    continue;
-                }
-                else if (vcpu->run->io.direction == KVM_EXIT_IO_OUT && vcpu->run->io.port == 0x3F9){
-                    uint8_t new_ier = *((char*)vcpu->run + vcpu->run->io.data_offset);
-
-                    if ((new_ier & 0x02) && !(ier & 0x02)) {
-                        struct kvm_irq_level irq_level = { .irq = 4, .level = 1};
-                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
-                        irq_level.level = 0;
-                        ioctl(vm->fd, KVM_IRQ_LINE, &irq_level);
+                else if (port == UART_IER) {
+                    if (is_out){
+                        uint8_t new_ier = *data;
+                        /* THR is always empty in this emulation, so enabling
+                        THRI needs an immediate kick to get the guest driver
+                        started. */
+                        if ((new_ier & UART_IER_THRI) && !(ier & UART_IER_THRI)){
+                            raise_irq4(vm);
+                        }
+                        ier = new_ier;
+                    } else {
+                        *data = ier;
                     }
-
-                    ier = new_ier;
                     continue;
                 }
-                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3F9){
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = ier;
-                    continue;
-                }
-                else if (vcpu->run->io.direction == KVM_EXIT_IO_IN && vcpu->run->io.port == 0x3FA){
-                    fd_set fds;
-                    FD_ZERO(&fds);
-                    FD_SET(STDIN_FILENO, &fds);
-                    struct timeval tv = {0, 0};
-                    int rx_ready = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
-
+                else if (port == UART_IIR && !is_out) {
                     uint8_t iir;
-                    if (rx_ready && (ier & 0x01))
-                        iir = 0x04;
-                    else if (ier & 0x02)
-                        iir = 0x02;
-                    else
-                        iir = 0x01;
+                    if (stdin_has_data() && (ier & UART_IER_RDI)){
+                        iir = UART_IIR_RDI;
+                    }
+                    else if (ier & UART_IER_THRI) {
+                        iir = UART_IIR_THRI;
+                    } else {
+                        iir = UART_IIR_NO_INT;
+                    }
+                    *data = iir;
+                    continue;
+                }
+                else if (port == UART_LCR) {
+                    if (is_out) {
+                        lcr = *data;
+                    } else {
+                        *data = lcr;
+                    }
+                    continue;
+                }
+                else if (port == UART_MCR){
+                    if (is_out) {
+                        mcr = *data;
+                    } else {
+                        *data = mcr;
+                    }
+                    continue;
+                }
+                else if (port == UART_LSR && !is_out){
+                    uint8_t lsr = UART_LSR_THRE | UART_LSR_TEMT;
+                    if (stdin_has_data()){
+                        lsr |= UART_LSR_DR;
+                    }
+                    *data = lsr;
+                    continue;
+                }
+                else if (port == UART_MSR && !is_out){
+                    /* Carrier permanently present so userspace opens don't
+                    block waiting for DCD. */
+                    *data = UART_MSR_DCD | UART_MSR_DSR | UART_MSR_CTS;
+                }
+                else if (port == UART_SCR){
+                    if (is_out){
+                        scratch = *data;
+                    } else {
+                        *data = scratch;
+                    }
+                    continue;
+                }
 
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = iir;
-                    continue;
-                }
-                else if (vcpu->run->io.port == 0x3FB){
-                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
-                        lcr = *((char*)vcpu->run + vcpu->run->io.data_offset);
-                    else
-                        *((char*)vcpu->run + vcpu->run->io.data_offset) = lcr;
-                    continue;
-                }
-                else if (vcpu->run->io.port == 0x3FC){
-                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
-                        mcr = *((char*)vcpu->run + vcpu->run->io.data_offset);
-                    else
-                        *((char*)vcpu->run + vcpu->run->io.data_offset) = mcr;
-                    continue;
-                }
-                else if (vcpu->run->io.port == 0x3FE && vcpu->run->io.direction == KVM_EXIT_IO_IN){
-                    *((char*)vcpu->run + vcpu->run->io.data_offset) = 0xB0; // DCD+CTS+DSR set
-                    continue;
-                }
-                else if (vcpu->run->io.port == 0x3FF){
-                    if (vcpu->run->io.direction == KVM_EXIT_IO_OUT)
-                        scratch = *((char*)vcpu->run + vcpu->run->io.data_offset);
-                    else
-                        *((char*)vcpu->run + vcpu->run->io.data_offset) = scratch; // must echo back what was written
-                    continue;
-                }
+                /* Unhandled port */
+                continue;
+            }
+
+            case KVM_EXIT_SHUTDOWN:
+                fprintf(stderr, "guest triple-faulted (KVM_EXIT_SHUTDOWN)\n");
+                dump_regs(vcpu);
+                return -1;
+
+            case KVM_EXIT_FAIL_ENTRY:
+                fprintf(stderr, "KVM_EXIT_FAIL_ENTRY: hardware_entry_failure_reason=0x%llx\n",
+                    vcpu->run->fail_entry.hardware_entry_failure_reason);
+                dump_regs(vcpu);
+                return -1;
+
+            case KVM_EXIT_INTERNAL_ERROR:
+                fprintf(stderr, "KVM_EXIT_INTERNAL_ERROR: suberror=0x%x\n",
+                    vcpu->run->internal.suberror);
+                dump_regs(vcpu);
+                return -1;
+
+            case KVM_EXIT_MMIO:
+                fprintf(stderr, "unexpected KVM_EXIT_MMIO at phys_addr=0x%llx (is write=%d, len=%u)\n",
+                    vcpu->run->mmio.phys_addr, vcpu->run->mmio.is_write, vcpu->run->mmio.len);
+                dump_regs(vcpu);
+                return -1;
             
             default:
-                // printf("not handled %u\n", vcpu->run->exit_reason);
-                continue;
+                fprintf(stderr, "unhandled exit_reason=%u\n", vcpu->run->exit_reason);
+                dump_regs(vcpu);
+                return -1;
         }
     }
 }
@@ -251,16 +342,19 @@ int load_bzimage(struct vm* vm, const char* filename){
 
     if (fread(&boot, 1, sizeof(boot), bzimage) != sizeof(boot)){
         printf("failed to read setup header\n");
+        fclose(bzimage);
         return -1;
     }
 
     if (memcmp(&boot.hdr.header, BZMAGIC, strlen(BZMAGIC))){
         printf("setup header missing magic\n");
+        fclose(bzimage);
         return -1;
     }
 
     if (fseek(bzimage, 0, SEEK_END)){
         printf("seek end 0 fail\n");
+        fclose(bzimage);
         return -1;
     }
 
@@ -268,6 +362,7 @@ int load_bzimage(struct vm* vm, const char* filename){
 
     if (fseek(bzimage, 0, SEEK_SET)){
         printf("seek set 0 fail\n");
+        fclose(bzimage);
         return -1;
     }
 
@@ -280,12 +375,14 @@ int load_bzimage(struct vm* vm, const char* filename){
     /* Loads real-mode code at 0x90000 in guest memory */
     if (fread((char*)vm->mem + 0x90000, 1, (setup_sects + 1) * 512, bzimage) != (setup_sects + 1) * 512){
         printf("failed to load real-mode code\n");
+        fclose(bzimage);
         return -1;
     }
 
     /* Loads the protected-mode code at 0x100000 in guest memory */
     if (fread((char*)vm->mem + 0x100000, 1, bzimage_size - (setup_sects + 1) * 512, bzimage) != bzimage_size - (setup_sects + 1) * 512){
         printf("failed to load protected mode code\n");
+        fclose(bzimage);
         return -1;
     }
 
@@ -299,6 +396,7 @@ int load_bzimage(struct vm* vm, const char* filename){
     size_t initramfs_size;
     if (load_initramfs(vm, &initramfs_size) == -1){
         printf("failed to load initramfs\n");
+        fclose(bzimage);
         return -1;
     }
 
@@ -344,6 +442,7 @@ int load_initramfs(struct vm* vm, size_t* out_size){
 
     if (fseek(initramfs, 0, SEEK_END)){
         printf("seek end 0 fail\n");
+        fclose(initramfs);
         return -1;
     }
 
@@ -351,11 +450,13 @@ int load_initramfs(struct vm* vm, size_t* out_size){
 
     if (fseek(initramfs, 0, SEEK_SET)){
         printf("seek set 0 fail\n");
+        fclose(initramfs);
         return -1;
     }
 
     if (fread((char*)vm->mem + 0x4000000, 1, initramfs_size, initramfs) != initramfs_size){
         printf("failed to load initramfs\n");
+        fclose(initramfs);
         return -1;
     }
 
@@ -409,5 +510,6 @@ void dump_regs(struct vcpu* vcpu){
 
     ioctl(vcpu->fd, KVM_GET_REGS, &regs);
 
-    printf("finished at rip=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n", regs.rip, regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi);
+    printf("finished at rip=0x%llx rsp=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
+        regs.rip, regs.rsp, regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi);
 }
