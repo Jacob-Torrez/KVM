@@ -1,4 +1,4 @@
-# nanovisor
+# Minimal KVM VMM
 
 A minimal x86-64 hypervisor written in C using the Linux KVM API.
 
