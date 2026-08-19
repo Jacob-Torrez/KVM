@@ -27,11 +27,15 @@ The host must have `/dev/kvm` available and accessible.
 The Linux kernel used by the VMM must have serial console support enabled, including:
 
 ```text
+CONFIG_TTY=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=4
+CONFIG_SERIAL_8250_RUNTIME_UARTS=4
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_BLK_DEV_INITRD=y
+CONFIG_BINFMT_SCRIPT=y
 ```
 
 ## How to Run
