@@ -2,6 +2,8 @@
 
 A minimal x86-64 hypervisor written in C using the Linux KVM API.
 
+<img width="1278" height="687" alt="Image" src="https://github.com/user-attachments/assets/1d39ac8e-146a-4c48-acb7-44c9e461e9b3" />
+
 **Note:** This project currently supports booting a Linux `bzImage` with a BusyBox-based initramfs into an interactive serial console. It does not currently support disks, networking, or multiple vCPUs.
 
 ## Directory Structure
