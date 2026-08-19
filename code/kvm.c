@@ -196,8 +196,12 @@ int vm_run(struct vm* vm, struct vcpu* vcpu){
     back out with EINTR so we can poll stdin and, if a byte is waiting and
     the guest has RX interrupts enabled, inject IRQ4 to wake the vCPU back
     up. */
-    signal(SIGALRM, sigalrm_handler);
-    siginterrupt(SIGALRM, 1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigalrm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* no SA_RESTART */
+    sigaction(SIGALRM, &sa, NULL);
 
     struct itimerval timer = {
         .it_value = { .tv_sec = 0, .tv_usec = 10000 },
